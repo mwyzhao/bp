@@ -82,7 +82,7 @@ void UpdatePredictor_2level(UINT32 PC, bool resolveDir, bool predDir, UINT32 bra
 // openend
 /////////////////////////////////////////////////////////////
 
-// TAGE
+// TAGE-SC
 
 /* NOTE: Values are UINTX and types/sizes/flags are int */
 /* NOTE: Maximum "size" values for function inputs/outputs are dictated by input/output type
@@ -98,7 +98,26 @@ void UpdatePredictor_2level(UINT32 PC, bool resolveDir, bool predDir, UINT32 bra
 // UINT32 and UINT64 defined in utils.h
 
 #define MAX_MEM        131072  // 128k in bytes
+
 #define GHR_SIZE       128     // bounded by UINT128, need custom impl for larger
+
+// SC PARAMETERS AND DEFINITIONS
+
+#define N_SC_TABLES    4
+
+#define SCI_SIZE       10
+#define SC_SIZE        1024
+
+#define SCTR_SIZE      6
+
+#define SC_THRESH      5
+#define TCTR_SIZE      8
+
+struct sc_entry {
+  UINT32 ctr;
+};
+
+// TAGE PARAMETERS AND DEFINITIONS
 
 #define N_TABLES       8       // number of tables (min 2, max 8)
 #define ALPHA          2       // base for geometric series
@@ -146,6 +165,16 @@ uniform_int_distribution<int> distribution(1, ALLOC_CHANCE);
 
 // GHR max 128 unfortunately, can be extended with hacks
 UINT128 ghr;
+
+// SC
+
+int sc_sum;
+UINT32 sc_thresh;
+UINT32 tctr;
+
+sc_entry sc_table[N_SC_TABLES][SC_SIZE];
+
+// TAGE
 
 // Counter to bias prediction away from using newly initialized predictions
 UINT32 use_alt_on_na;
@@ -228,8 +257,9 @@ inline UINT32 get_max_ghr(){
 UINT32 get_mem_usage(){
   UINT32 bt_usage = BT_SIZE * BCTR_SIZE;
   UINT32 gt_usage = (N_TABLES - 1) * GT_SIZE * (GCTR_SIZE + TAG_SIZE + U_SIZE);
+  UINT32 sc_usage = N_TABLES * SC_SIZE * SCTR_SIZE;
   UINT32 misc_usage = 1024; // hw implementation safety factor include ghr register, etc.
-  return bt_usage + gt_usage + misc_usage;
+  return bt_usage + gt_usage + sc_usage + misc_usage;
 }
 
 // print resource usage and warnings
@@ -310,6 +340,15 @@ void InitPredictor_openend() {
 #endif
   print_usage();
   ghr = 0; // init to all not taken
+  // SC
+  sc_thresh = SC_THRESH;
+  tctr = get_weak_taken(TCTR_SIZE);
+  for(int i = 0; i < N_SC_TABLES; i++){
+    for(int j = 0; j < SC_SIZE; j++){
+      sc_table[i][j].ctr = get_weak_taken(SCTR_SIZE);
+    }
+  }
+  // TAGE
   use_alt_on_na = get_weak_taken(UAON_SIZE); // init to weak used
   n_branches = 0; // init u reset counter
   u_reset_bit = U_SIZE - 1; // u_reset_bit goes from U_SIZE-1 to 0
@@ -328,6 +367,7 @@ void InitPredictor_openend() {
 bool GetPrediction_openend(UINT32 PC) {
   // Make prediction
   int prediction;
+  UINT32 prediction_ctr;
   int pred_made = 0;
   int altpred_made = 0;
   // Find entry with matching tag from longest history table for pred and altpred
@@ -346,6 +386,7 @@ bool GetPrediction_openend(UINT32 PC) {
            low_confidence(global_table[pred_table][pred_index].ctr, GCTR_SIZE) &&
            get_msb(use_alt_on_na, UAON_SIZE)){
           prediction = altpred;
+          prediction_ctr = global_table[i][index].ctr;
         }
         break; // exit loop
       }
@@ -355,6 +396,7 @@ bool GetPrediction_openend(UINT32 PC) {
       pred_table = i;
       pred_index = index;
       prediction = pred;
+      prediction_ctr = global_table[i][index].ctr;
       // if(get_msb(global_table[i][index].ctr, U_SIZE)) cout << "useful" << endl;
       continue; // continue to find alpred
     }
@@ -366,6 +408,7 @@ bool GetPrediction_openend(UINT32 PC) {
     pred_table = 0;
     pred_index = PC & get_mask(BTI_SIZE);
     prediction = pred;
+    prediction_ctr = base_table[PC & get_mask(BTI_SIZE)].ctr;
   }
   // If no altpred match found in global tables, use base bimodal table
   if(!altpred_made){
@@ -379,8 +422,18 @@ bool GetPrediction_openend(UINT32 PC) {
        low_confidence(global_table[pred_table][pred_index].ctr, GCTR_SIZE) &&
        get_msb(use_alt_on_na, UAON_SIZE)){
       prediction = altpred;
+      prediction_ctr = base_table[PC & get_mask(BTI_SIZE)].ctr;
     }
   }
+  // Check with SC
+  sc_sum = 0;
+  for(int i = 0; i < N_SC_TABLES; i++){
+    int sc_index = get_index(PC, sizeof(PC)*8, ghr, get_l(i+1), SCI_SIZE) ^ prediction_ctr;
+    sc_sum += ((sc_table[i][sc_index].ctr - get_weak_taken(SCTR_SIZE)) << 1) + 1;
+  }
+  int signed_pred = prediction == TAKEN ? 1 : -1;
+  int sc_pred = sc_sum + (((signed_pred << 1) + 1) << 3) >= 0;
+  prediction = sc_pred;
   return prediction;
 }
 
@@ -397,6 +450,21 @@ void UpdatePredictor_openend(UINT32 PC, bool resolveDir, bool predDir, UINT32 br
     }
   }
 #endif
+  // SC
+  if(predDir != resolveDir || (UINT32)abs(sc_sum) < sc_thresh){
+    for(int i = 0; i < N_SC_TABLES; i++){
+      int sc_index = get_index(PC, sizeof(PC)*8, ghr, get_l(i+1), SCI_SIZE);
+      sc_index ^= predDir;
+      sc_table[i][sc_index].ctr =
+        update_ctr(resolveDir == TAKEN, sc_table[i][sc_index].ctr, SCTR_SIZE);
+    }
+    tctr = update_ctr(predDir != resolveDir, tctr, TCTR_SIZE);
+    if(tctr == get_mask(TCTR_SIZE)){
+      sc_thresh++;
+      tctr = get_weak_not_taken(TCTR_SIZE);
+    }
+  }
+  // TAGE
   // The order of the following update steps can be changed
   // Update base table
   base_table[PC & get_mask(BTI_SIZE)].ctr =
@@ -435,6 +503,14 @@ void UpdatePredictor_openend(UINT32 PC, bool resolveDir, bool predDir, UINT32 br
     global_table[pred_table][pred_index].ctr =
       update_ctr(resolveDir == TAKEN, global_table[pred_table][pred_index].ctr, GCTR_SIZE);
   }
+  // This was found to be unnecessary
+  // Also update altpred if both were correct
+  // if(pred == resolveDir &&
+  //    altpred_table != 0 &&
+  //    low_confidence(global_table[pred_table][pred_index].ctr, GCTR_SIZE)){
+  //   global_table[altpred_table][altpred_index].ctr =
+  //     update_ctr(resolveDir == TAKEN, global_table[altpred_table][altpred_index].ctr, GCTR_SIZE);
+  // }
   // Allocate new table entries
   // when pred was wrong and did not come from longest history table
   if(pred != resolveDir && pred_table < N_TABLES - 1){
