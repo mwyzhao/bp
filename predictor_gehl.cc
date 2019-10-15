@@ -82,7 +82,7 @@ void UpdatePredictor_2level(UINT32 PC, bool resolveDir, bool predDir, UINT32 bra
 // openend
 /////////////////////////////////////////////////////////////
 
-// TAGE-SC
+// O-GEHL
 
 /* NOTE: Values are UINTX and types/sizes/flags are int */
 /* NOTE: Maximum "size" values for function inputs/outputs are dictated by input/output type
@@ -277,3 +277,4 @@ void UpdatePredictor_openend(UINT32 PC, bool resolveDir, bool predDir, UINT32 br
 void TermPredictor_openend() {
   ;
 }
+

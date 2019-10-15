@@ -94,33 +94,20 @@ void UpdatePredictor_2level(UINT32 PC, bool resolveDir, bool predDir, UINT32 bra
 
 // #define COLL_STAT
 
+// GLOBAL DEFINES
+
 #define UINT128 unsigned __int128
 // UINT32 and UINT64 defined in utils.h
 
 #define MAX_MEM       131072  // 128k in bytes
 #define MAX_GHR       128     // bounded by UINT128, need custom impl for larger
 
-// SC PARAMETERS AND DEFINITIONS
-
-#define N_SC_TABLES    5      // number of GEHL tables
-
-#define SCTR_SIZE      6      // GEHL table counter size
-
-#define SCI_SIZE       10     // size of GEHL table index
-#define SC_SIZE        1024   // 2^SCI_SIZE, number of GEHL table entires
-
-#define SC_THRESH      5      // initial threshold (unused)
-#define TCTR_SIZE      7      // threshold counter (unused)
-
-struct sc_entry {
-  UINT32 ctr;
-};
-
-// TAGE PARAMETERS AND DEFINITIONS
-
-#define N_TABLES       8       // number of tables
 #define ALPHA          2       // base for geometric series
 #define L1             2       // initial value for geometric series
+
+// TAGE DEFINES
+
+#define N_TABLES       8       // number of tables
 
 #define BCTR_SIZE      2       // base prediction counter size
 #define GCTR_SIZE      3       // global prediction counter size
@@ -147,6 +134,22 @@ struct global_entry {
   UINT32 u;
 };
 
+// STATISTICAL CORRECTOR (GEHL) DEFINES
+
+#define N_SC_TABLES    5
+
+#define SCTR_SIZE      6
+
+#define SCI_SIZE       10
+#define SC_SIZE        1024
+
+#define SC_THRESH      5
+#define TCTR_SIZE      7
+
+struct sc_entry {
+  UINT32 ctr;
+};
+
 /*******************************************************************************************
  * STATISTIC COLLECTION VARIABLES
  *******************************************************************************************/
@@ -159,24 +162,13 @@ int num_times_useful[N_TABLES];
  * GLOBAL VARIABLES
  *******************************************************************************************/
 
+// GLOBAL
+
 default_random_engine generator;
 uniform_int_distribution<int> distribution(1, ALLOC_CHANCE);
 
 // GHR max 128 unfortunately, can be extended with hacks
 UINT128 ghr;
-
-// SC
-
-int sc_sum;
-
-UINT32 sc_thresh;
-UINT32 tctr;
-
-UINT32 prediction_table;
-UINT32 prediction_ctr;
-
-
-sc_entry sc_table[N_SC_TABLES][SC_SIZE];
 
 // TAGE
 
@@ -200,6 +192,21 @@ int u_reset_bit;
 base_entry base_table[BT_SIZE];
 // T1 - TN-1, NOTE: global_table[0] unused
 global_entry global_table[N_TABLES][GT_SIZE];
+
+// SC (GEHL)
+
+// GEHL decision making counter
+int sc_sum;
+
+// Tage decision tracker
+UINT32 prediction_ctr;
+
+// Update counters
+UINT32 sc_thresh;
+UINT32 tctr;
+
+// GEHL tables
+sc_entry sc_table[N_SC_TABLES][SC_SIZE];
 
 /*******************************************************************************************
  * UTILITY FUNCTIONS
@@ -343,15 +350,8 @@ void InitPredictor_openend() {
   }
 #endif
   print_usage();
+  // GLOBAL
   ghr = 0; // init to all not taken
-  // SC
-  sc_thresh = SC_THRESH;
-  tctr = get_weak_taken(TCTR_SIZE);
-  for(int i = 0; i < N_SC_TABLES; i++){
-    for(int j = 0; j < SC_SIZE; j++){
-      sc_table[i][j].ctr = get_weak_taken(SCTR_SIZE);
-    }
-  }
   // TAGE
   use_alt_on_na = get_weak_taken(UAON_SIZE); // init to weak used
   n_branches = 0; // init u reset counter
@@ -366,11 +366,21 @@ void InitPredictor_openend() {
       global_table[i][j].u   = 0;
     }
   }
+  // SC
+  sc_thresh = SC_THRESH; // init threshold
+  tctr = get_weak_taken(TCTR_SIZE);
+  for(int i = 0; i < N_SC_TABLES; i++){
+    for(int j = 0; j < SC_SIZE; j++){
+      sc_table[i][j].ctr = get_weak_taken(SCTR_SIZE);
+    }
+  }
 }
 
 bool GetPrediction_openend(UINT32 PC) {
+  // TAGE
   // Make prediction
   int prediction;
+  int prediction_table;
   int pred_made = 0;
   int altpred_made = 0;
   // Find entry with matching tag from longest history table for pred and altpred
@@ -402,7 +412,6 @@ bool GetPrediction_openend(UINT32 PC) {
       prediction = pred;
       prediction_table = pred_table;
       prediction_ctr = global_table[i][index].ctr;
-      // if(get_msb(global_table[i][index].ctr, U_SIZE)) cout << "useful" << endl;
       continue; // continue to find alpred
     }
   }
@@ -432,22 +441,24 @@ bool GetPrediction_openend(UINT32 PC) {
       prediction_ctr = base_table[PC & get_mask(BTI_SIZE)].ctr;
     }
   }
-  // Check with SC
+  // SC
+  // Double check Tage prediction with GEHL
+  // find (centered) avg of GEHL entries
   sc_sum = 0;
   for(int i = 0; i < N_SC_TABLES; i++){
     UINT32 sc_index = get_tag(PC, sizeof(PC)*8, ghr, get_l(i+1), SCI_SIZE) ^ prediction_ctr;
     sc_sum += ((sc_table[i][sc_index].ctr - get_weak_taken(SCTR_SIZE)) << 1) + 1;
   }
-  // int signed_pred = prediction == TAKEN ? 1 : -1;
-  int signed_pred;
+  // add (centered and scaled) Tage prediction
+  int sc_val;
   if(prediction_table == 0){
-    signed_pred = prediction_ctr - get_weak_taken(BCTR_SIZE);
+    sc_val = sc_sum + (((prediction_ctr - get_weak_taken(BCTR_SIZE)) << 1) + 1) * (N_SC_TABLES);
   }
   else{
-    signed_pred = prediction_ctr - get_weak_taken(GCTR_SIZE);
+    sc_val = sc_sum + (((prediction_ctr - get_weak_taken(GCTR_SIZE)) << 1) + 1) * (N_SC_TABLES);
   }
-  int sc_result = sc_sum + ((signed_pred << 1) + 1)*N_SC_TABLES;
-  prediction = sc_result >= 0;
+  // return sign as prediction
+  prediction = sc_val >= 0;
   return prediction;
 }
 
@@ -464,28 +475,6 @@ void UpdatePredictor_openend(UINT32 PC, bool resolveDir, bool predDir, UINT32 br
     }
   }
 #endif
-  // SC
-  if(predDir != resolveDir || (UINT32)abs(sc_sum) < sc_thresh){
-    for(int i = 0; i < N_SC_TABLES; i++){
-      UINT32 sc_index = get_tag(PC, sizeof(PC)*8, ghr, get_l(i+1), SCI_SIZE) ^ prediction_ctr;
-      sc_table[i][sc_index].ctr =
-        update_ctr(resolveDir == TAKEN, sc_table[i][sc_index].ctr, SCTR_SIZE);
-    }
-  }
-  if(predDir != resolveDir){
-    tctr = sat_ctr_inc(tctr, TCTR_SIZE);
-    if(tctr == get_mask(TCTR_SIZE)){
-      sc_thresh++;
-      tctr = get_weak_taken(TCTR_SIZE);
-    }
-  }
-  if(predDir == resolveDir && (UINT32)abs(sc_sum) < sc_thresh){
-    tctr = sat_ctr_dec(tctr, TCTR_SIZE);
-    if(tctr == 0){
-      sc_thresh--;
-      tctr = get_weak_taken(TCTR_SIZE);
-    }
-  }
   // TAGE
   // The order of the following update steps can be changed
   // Update base table
@@ -572,6 +561,30 @@ void UpdatePredictor_openend(UINT32 PC, bool resolveDir, bool predDir, UINT32 br
         global_table[table][entry].u   = 0;
         break;
       }
+    }
+  }
+  // SC
+  // update table entires
+  if(predDir != resolveDir || (UINT32)abs(sc_sum) < sc_thresh){
+    for(int i = 0; i < N_SC_TABLES; i++){
+      int sc_index = get_tag(PC, sizeof(PC)*8, ghr, get_l(i+1), SCI_SIZE) ^ prediction_ctr;
+      sc_table[i][sc_index].ctr =
+        update_ctr(resolveDir == TAKEN, sc_table[i][sc_index].ctr, SCTR_SIZE);
+    }
+  }
+  // update threshold
+  if(predDir != resolveDir){
+    tctr = sat_ctr_inc(tctr, TCTR_SIZE);
+    if(tctr == get_mask(TCTR_SIZE)){
+      sc_thresh++;
+      tctr = get_weak_taken(TCTR_SIZE);
+    }
+  }
+  if(predDir == resolveDir && (UINT32)abs(sc_sum) < sc_thresh){
+    tctr = sat_ctr_dec(tctr, TCTR_SIZE);
+    if(tctr == 0){
+      sc_thresh--;
+      tctr = get_weak_taken(TCTR_SIZE);
     }
   }
   // Update GHR last
