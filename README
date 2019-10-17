@@ -1,0 +1,11 @@
+Implementations of O-GEHL, TAGE, and TAGE_SC for ECE552F 2019
+
+WARNING: Although TAGE is the best general predictor, beware that the ECE552 benchmarks may not lend well to TAGE. Try other implementations too if you really want to be number one.
+
+
+Some stats
+----------
+O-GEHL :  6.1 MPKI
+TAGE   :  5.4 MPKI
+TAGE-SC:  5.3 MPKI
+
