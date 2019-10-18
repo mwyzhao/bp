@@ -103,7 +103,7 @@ void UpdatePredictor_2level(UINT32 PC, bool resolveDir, bool predDir, UINT32 bra
 
 // SC PARAMETERS AND DEFINITIONS
 
-#define N_SC_TABLES    7
+#define N_SC_TABLES    8
 #define ALPHA          2
 #define L1             4
 
